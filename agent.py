@@ -2,6 +2,7 @@ import json
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
 
 from openai import OpenAI
@@ -78,6 +79,68 @@ Prefer tools over prose.
 Skills available:
 {SKILL_LOADER.get_descriptions()}"""
 SUBAGENT_SYSTEM = f"You are a coding subagent at {WORKDIR}. Complete the given task, then summarize your findings."
+
+THRESHOLD = 50000
+TRANSCRIPT_DIR = WORKDIR / ".transcripts"
+KEEP_RECENT = 3
+
+
+def estimate_tokens(messages: list) -> int:
+    """Rough token count: ~4 chars per token."""
+    return len(str(messages)) // 4
+
+
+# -- Layer 1: micro_compact - replace old tool results with placeholders --
+def micro_compact(messages: list) -> list:
+    # Collect tool result messages (OpenAI format: {"role": "tool", ...})
+    tool_results = []
+    for msg_idx, msg in enumerate(messages):
+        if msg["role"] == "tool":
+            tool_results.append((msg_idx, msg))
+    if len(tool_results) <= KEEP_RECENT:
+        return messages
+    # Find tool_name for each result by matching tool_call_id in prior assistant messages
+    tool_name_map = {}
+    for msg in messages:
+        if msg["role"] == "assistant" and "tool_calls" in msg:
+            for tc in msg["tool_calls"]:
+                tool_name_map[tc["id"]] = tc["function"]["name"]
+    # Clear old results (keep last KEEP_RECENT)
+    to_clear = tool_results[:-KEEP_RECENT]
+    for _, msg in to_clear:
+        if isinstance(msg.get("content"), str) and len(msg["content"]) > 100:
+            tool_id = msg.get("tool_call_id", "")
+            tool_name = tool_name_map.get(tool_id, "unknown")
+            msg["content"] = f"[Previous: used {tool_name}]"
+    return messages
+
+
+# -- Layer 2: auto_compact - save transcript, summarize, replace messages --
+def auto_compact(messages: list) -> list:
+    # Save full transcript to disk
+    TRANSCRIPT_DIR.mkdir(exist_ok=True)
+    transcript_path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
+    with open(transcript_path, "w") as f:
+        for msg in messages:
+            f.write(json.dumps(msg, default=str) + "\n")
+    print(f"[transcript saved: {transcript_path}]")
+    # Ask LLM to summarize
+    conversation_text = json.dumps(messages, default=str)[:80000]
+    response = client.chat.completions.create(
+        model=MODEL,
+        messages=[{"role": "user", "content":
+            "Summarize this conversation for continuity. Include: "
+            "1) What was accomplished, 2) Current state, 3) Key decisions made. "
+            "Be concise but preserve critical details.\n\n" + conversation_text}],
+        max_tokens=2000,
+    )
+    summary = response.choices[0].message.content
+    # Replace all messages with compressed summary
+    return [
+        {"role": "user", "content": f"[Conversation compressed. Transcript: {transcript_path}]\n\n{summary}"},
+        {"role": "assistant", "content": "Understood. I have the context from the summary. Continuing."},
+    ]
+
 
 
 # -- TodoManager: structured state the LLM writes to --
@@ -182,6 +245,7 @@ TOOL_HANDLERS = {
     "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
     "todo":       lambda **kw: TODO.update(kw["items"]),
     "load_skill": lambda **kw: SKILL_LOADER.get_content(kw["name"]),
+    "compact":    lambda **kw: "Manual compression requested.",
 }
 
 # Child gets all base tools (no task -- no recursive spawning)
@@ -238,12 +302,20 @@ PARENT_TOOLS = CHILD_TOOLS + [
      "parameters": {"type": "object", "properties": {"items": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "text": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}}, "required": ["id", "text", "status"]}}}, "required": ["items"]}}},
     {"type": "function", "function": {"name": "task", "description": "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.",
      "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}, "description": {"type": "string", "description": "Short description of the task"}}, "required": ["prompt"]}}},
+    {"type": "function", "function": {"name": "compact", "description": "Trigger manual conversation compression.",
+     "parameters": {"type": "object", "properties": {"focus": {"type": "string", "description": "What to preserve in the summary"}}}}},
 ]
 
 
 def agent_loop(messages: list):
     rounds_since_todo = 0
     while True:
+        # Layer 1: micro_compact before each LLM call
+        micro_compact(messages)
+        # Layer 2: auto_compact if token estimate exceeds threshold
+        if estimate_tokens(messages) > THRESHOLD:
+            print("[auto_compact triggered]")
+            messages[:] = auto_compact(messages)
         response = client.chat.completions.create(
             model=MODEL,
             messages=[{"role": "system", "content": SYSTEM}] + messages,
@@ -268,12 +340,16 @@ def agent_loop(messages: list):
             return
         # Execute each tool call, append results
         used_todo = False
+        manual_compact = False
         for tc in choice.message.tool_calls:
             args = json.loads(tc.function.arguments)
             if tc.function.name == "task":
                 desc = args.get("description", "subtask")
                 print(f"> task ({desc}): {args['prompt'][:80]}")
                 output = run_subagent(args["prompt"])
+            elif tc.function.name == "compact":
+                manual_compact = True
+                output = "Compressing..."
             else:
                 handler = TOOL_HANDLERS.get(tc.function.name)
                 output = handler(**args) if handler else f"Unknown tool: {tc.function.name}"
@@ -281,6 +357,10 @@ def agent_loop(messages: list):
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})
             if tc.function.name == "todo":
                 used_todo = True
+        # Layer 3: manual compact triggered by the compact tool
+        if manual_compact:
+            print("[manual compact]")
+            messages[:] = auto_compact(messages)
         rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
         if rounds_since_todo >= 3:
             messages.append({"role": "user", "content": "<reminder>Update your todos.</reminder>"})
