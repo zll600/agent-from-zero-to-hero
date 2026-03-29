@@ -16,9 +16,10 @@ client: OpenAI = OpenAI(
 MODEL = os.environ["MODEL_ID"]
 
 SYSTEM = f"""You are a coding agent at {WORKDIR}.
-Use the todo tool to plan multi-step tasks. Mark in_progress before starting, \
-completed when done.
+Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.
+Use the task tool to delegate exploration or subtasks.
 Prefer tools over prose."""
+SUBAGENT_SYSTEM = f"You are a coding subagent at {WORKDIR}. Complete the given task, then summarize your findings."
 
 
 # -- TodoManager: structured state the LLM writes to --
@@ -124,98 +125,60 @@ TOOL_HANDLERS = {
     "todo":       lambda **kw: TODO.update(kw["items"]),
 }
 
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "bash",
-            "description": "Run a shell command.",
-            "parameters": {
-                "type": "object",
-                "properties": {"command": {"type": "string"}},
-                "required": ["command"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": "Read file contents.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "limit": {"type": "integer"}
-                },
-                "required": ["path"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "write_file",
-            "description": "Write content to file.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "content": {"type": "string"}
-                },
-                "required": ["path", "content"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "edit_file",
-            "description": "Replace exact text in file.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "old_text": {"type": "string"},
-                    "new_text": {"type": "string"}
-                },
-                "required": ["path", "old_text", "new_text"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "todo",
-            "description": "Update tasks list. Track progress",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "items": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "id": {"type": "string"},
-                                "text": {"type": "string"},
-                                "status": {
-                                    "type": "string",
-                                    "enum": [
-                                        "pending",
-                                        "in_progress",
-                                        "completed"
-                                    ]
-                                }
-                            },
-                            "required": ["id", "text", "status"]
-                        }
-                    }
-                },
-                "required": ["items"]
-            }
-        }
-    },
+# Child gets all base tools (no task -- no recursive spawning)
+CHILD_TOOLS = [
+    {"type": "function", "function": {"name": "bash", "description": "Run a shell command.",
+     "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}},
+    {"type": "function", "function": {"name": "read_file", "description": "Read file contents.",
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}}},
+    {"type": "function", "function": {"name": "write_file", "description": "Write content to file.",
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}}},
+    {"type": "function", "function": {"name": "edit_file", "description": "Replace exact text in file.",
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}}},
 ]
+
+
+# -- Subagent: fresh context, filtered tools, summary-only return --
+def run_subagent(prompt: str) -> str:
+    sub_messages = [{"role": "user", "content": prompt}]  # fresh context
+    for _ in range(30):  # safety limit
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "system", "content": SUBAGENT_SYSTEM}] + sub_messages,
+            tools=CHILD_TOOLS,
+            max_tokens=8000,
+        )
+        choice = response.choices[0]
+        assistant_msg = {"role": "assistant", "content": choice.message.content or ""}
+        if choice.message.tool_calls:
+            assistant_msg["tool_calls"] = [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                }
+                for tc in choice.message.tool_calls
+            ]
+        sub_messages.append(assistant_msg)
+        if choice.finish_reason != "tool_calls":
+            break
+        for tc in choice.message.tool_calls:
+            args = json.loads(tc.function.arguments)
+            handler = TOOL_HANDLERS.get(tc.function.name)
+            output = handler(**args) if handler else f"Unknown tool: {tc.function.name}"
+            sub_messages.append({"role": "tool", "tool_call_id": tc.id, "content": str(output)[:50000]})
+    # Only the final text returns to the parent -- child context is discarded
+    return choice.message.content or "(no summary)"
+
+
+# -- Parent tools: base tools + todo + task dispatcher --
+PARENT_TOOLS = CHILD_TOOLS + [
+    {"type": "function", "function": {"name": "todo", "description": "Update tasks list. Track progress on multi-step tasks.",
+     "parameters": {"type": "object", "properties": {"items": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "text": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}}, "required": ["id", "text", "status"]}}}, "required": ["items"]}}},
+    {"type": "function", "function": {"name": "task", "description": "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.",
+     "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}, "description": {"type": "string", "description": "Short description of the task"}}, "required": ["prompt"]}}},
+]
+
 
 def agent_loop(messages: list):
     rounds_since_todo = 0
@@ -223,7 +186,7 @@ def agent_loop(messages: list):
         response = client.chat.completions.create(
             model=MODEL,
             messages=[{"role": "system", "content": SYSTEM}] + messages,
-            tools=TOOLS,
+            tools=PARENT_TOOLS,
             max_tokens=8000,
         )
         choice = response.choices[0]
@@ -246,8 +209,13 @@ def agent_loop(messages: list):
         used_todo = False
         for tc in choice.message.tool_calls:
             args = json.loads(tc.function.arguments)
-            handler = TOOL_HANDLERS.get(tc.function.name)
-            output = handler(**args) if handler else f"Unknown tool: {tc.function.name}"
+            if tc.function.name == "task":
+                desc = args.get("description", "subtask")
+                print(f"> task ({desc}): {args['prompt'][:80]}")
+                output = run_subagent(args["prompt"])
+            else:
+                handler = TOOL_HANDLERS.get(tc.function.name)
+                output = handler(**args) if handler else f"Unknown tool: {tc.function.name}"
             print(f"> {tc.function.name}: {output[:500]}")
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})
             if tc.function.name == "todo":
