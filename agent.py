@@ -4,6 +4,8 @@ import re
 import subprocess
 import time
 from pathlib import Path
+import threading
+import uuid
 
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -102,6 +104,69 @@ class TaskManager:
 
 TASKS = TaskManager(TASKS_DIR)
 
+class BackgroundManager:
+    def __init__(self):
+        self.tasks = {}  # task_id -> {status, result, command}
+        self._notification_queue = []  # completed task results
+        self._lock = threading.Lock()
+
+    def run(self, command: str) -> str:
+        """Start a background thread, return task_id immediately."""
+        task_id = str(uuid.uuid4())[:8]
+        self.tasks[task_id] = {"status": "running", "result": None, "command": command}
+        thread = threading.Thread(
+            target=self._execute, args=(task_id, command), daemon=True
+        )
+        thread.start()
+        return f"Background task {task_id} started: {command[:80]}"
+
+    def _execute(self, task_id: str, command: str):
+        """Thread target: run subprocess, capture output, push to queue."""
+        try:
+            r = subprocess.run(
+                command, shell=True, cwd=WORKDIR,
+                capture_output=True, text=True, timeout=300
+            )
+            output = (r.stdout + r.stderr).strip()[:50000]
+            status = "completed"
+        except subprocess.TimeoutExpired:
+            output = "Error: Timeout (300s)"
+            status = "timeout"
+        except Exception as e:
+            output = f"Error: {e}"
+            status = "error"
+        self.tasks[task_id]["status"] = status
+        self.tasks[task_id]["result"] = output or "(no output)"
+        with self._lock:
+            self._notification_queue.append({
+                "task_id": task_id,
+                "status": status,
+                "command": command[:80],
+                "result": (output or "(no output)")[:500],
+            })
+
+    def check(self, task_id: str = None) -> str:
+        """Check status of one task or list all."""
+        if task_id:
+            t = self.tasks.get(task_id)
+            if not t:
+                return f"Error: Unknown task {task_id}"
+            return f"[{t['status']}] {t['command'][:60]}\n{t.get('result') or '(running)'}"
+        lines = []
+        for tid, t in self.tasks.items():
+            lines.append(f"{tid}: [{t['status']}] {t['command'][:60]}")
+        return "\n".join(lines) if lines else "No background tasks."
+
+    def drain_notifications(self) -> list:
+        """Return and clear all pending completion notifications."""
+        with self._lock:
+            notifs = list(self._notification_queue)
+            self._notification_queue.clear()
+        return notifs
+
+
+BG = BackgroundManager()
+
 
 # -- SkillLoader: scan skills/<name>/SKILL.md with YAML frontmatter --
 class SkillLoader:
@@ -157,7 +222,8 @@ SKILL_LOADER = SkillLoader(SKILLS_DIR)
 
 SYSTEM = f"""You are a coding agent at {WORKDIR}.
 Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.
-Use the task tool to delegate exploration or subtasks.
+Use the task tool to delegate exploration or subtasks, and manage tasks dependencies.
+Use background_run for long-running commands
 Use load_skill to access specialized knowledge before tackling unfamiliar topics.
 Prefer tools over prose.
 
@@ -331,6 +397,8 @@ TOOL_HANDLERS = {
     "todo":       lambda **kw: TODO.update(kw["items"]),
     "load_skill": lambda **kw: SKILL_LOADER.get_content(kw["name"]),
     "compact":    lambda **kw: "Manual compression requested.",
+    "background_run":   lambda **kw: BG.run(kw["command"]),
+    "check_background": lambda **kw: BG.check(kw.get("task_id")),
     "task_create": lambda **kw: TASKS.create(kw["subject"], kw.get("description", "")),
     "task_update": lambda **kw: TASKS.update(kw["task_id"], kw.get("status"), kw.get("addBlockedBy"), kw.get("addBlocks")),
     "task_list":   lambda **kw: TASKS.list_all(),
@@ -393,6 +461,10 @@ PARENT_TOOLS = CHILD_TOOLS + [
      "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}, "description": {"type": "string", "description": "Short description of the task"}}, "required": ["prompt"]}}},
     {"type": "function", "function": {"name": "compact", "description": "Trigger manual conversation compression.",
      "parameters": {"type": "object", "properties": {"focus": {"type": "string", "description": "What to preserve in the summary"}}}}},
+    {"type": "function", "function": {"name": "background_run", "description": "Run command in background thread. Returns task_id immediately.",
+     "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}},
+    {"type": "function", "function": {"name": "check_background", "description": "Check background task status. Omit task_id to list all.",
+     "parameters": {"type": "object", "properties": {"task_id": {"type": "string"}}}}},
     {"type": "function", "function": {"name": "task_create", "description": "Create a new task.",
      "parameters": {"type": "object", "properties": {"subject": {"type": "string"}, "description": {"type": "string"}}, "required": ["subject"]}}},
     {"type": "function", "function": {"name": "task_update", "description": "Update a task's status or dependencies.",
@@ -407,6 +479,14 @@ PARENT_TOOLS = CHILD_TOOLS + [
 def agent_loop(messages: list):
     rounds_since_todo = 0
     while True:
+        # Drain background notifications and inject before LLM call
+        notifs = BG.drain_notifications()
+        if notifs and messages:
+            notif_text = "\n".join(
+                f"[bg:{n['task_id']}] {n['status']}: {n['result']}" for n in notifs
+            )
+            messages.append({"role": "user", "content": f"<background-results>\n{notif_text}\n</background-results>"})
+            messages.append({"role": "assistant", "content": "Noted background results."})
         # Layer 1: micro_compact before each LLM call
         micro_compact(messages)
         # Layer 2: auto_compact if token estimate exceeds threshold
